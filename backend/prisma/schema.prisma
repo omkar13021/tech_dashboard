@@ -1,0 +1,517 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  SUPERADMIN
+  ADMIN
+  HOD
+  LEAD
+  ASSOCIATE
+}
+
+enum Department {
+  TECH
+  MARKETING
+  HR
+  SALES
+  OPERATIONS
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic RBAC engine
+// `Role` (enum) is kept as a compatibility seed; authorization is resolved from
+// the dynamic AppRole / Permission / RolePermission / UserPermissionOverride
+// tables via the effective-permission resolver.
+// ---------------------------------------------------------------------------
+
+enum PermissionEffect {
+  GRANT
+  REVOKE
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  key         String   @unique // "module.action", e.g. "task.view"
+  module      String // "task"
+  action      String // "view"
+  label       String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  roles     RolePermission[]
+  overrides UserPermissionOverride[]
+
+  @@index([module])
+  @@map("permissions")
+}
+
+model AppRole {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  slug        String   @unique
+  description String?
+  isSystem    Boolean  @default(false) // seeded roles cannot be deleted
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  permissions RolePermission[]
+  users       User[]
+
+  @@index([isActive])
+  @@map("roles")
+}
+
+model RolePermission {
+  id           String     @id @default(cuid())
+  roleId       String
+  role         AppRole    @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permissionId String
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  createdAt    DateTime   @default(now())
+
+  @@unique([roleId, permissionId])
+  @@index([roleId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+model UserPermissionOverride {
+  id           String           @id @default(cuid())
+  userId       String
+  user         User             @relation("UserPermissionOverrides", fields: [userId], references: [id], onDelete: Cascade)
+  permissionId String
+  permission   Permission       @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  effect       PermissionEffect
+  createdAt    DateTime         @default(now())
+
+  @@unique([userId, permissionId])
+  @@index([userId])
+  @@map("user_permission_overrides")
+}
+
+model User {
+  id            String         @id @default(cuid())
+  firstName     String
+  lastName      String
+  email         String         @unique
+  passwordHash  String
+  role          Role           @default(ASSOCIATE)
+  isActive      Boolean        @default(true)
+  profileImage  String?
+
+  // Organizational metadata (User Management module)
+  department    Department?
+  jobTitle      String?
+  phone         String?
+  location      String?
+
+  // Manager / reporting line (self-relation)
+  managerId     String?
+  manager       User?          @relation("UserManager", fields: [managerId], references: [id], onDelete: SetNull)
+  reports       User[]         @relation("UserManager")
+
+  // Dynamic role (additive hybrid; `role` enum above kept for compatibility/seed)
+  roleId        String?
+  roleRef       AppRole?       @relation(fields: [roleId], references: [id], onDelete: SetNull)
+
+  // Delegated assistant: an assistant is a normal user delegated under a principal
+  principalId   String?
+  principal     User?          @relation("UserDelegation", fields: [principalId], references: [id], onDelete: SetNull)
+  assistants    User[]         @relation("UserDelegation")
+
+  // User-level permission overrides (grant / revoke on top of role permissions)
+  permissionOverrides UserPermissionOverride[] @relation("UserPermissionOverrides")
+
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  refreshTokens RefreshToken[]
+
+  // Task relations
+  createdTasks    Task[]        @relation("TaskCreator")
+  assignedTasks   Task[]        @relation("TaskAssignee")
+  assignedByTasks Task[]        @relation("TaskAssignedBy")
+  taskComments    TaskComment[] @relation("TaskCommentAuthor")
+
+  // Hierarchical task-tracking relations
+  taskAttachments     TaskAttachment[] @relation("TaskAttachmentUploadedBy")
+  taskAssignmentsFrom TaskAssignment[] @relation("TaskAssignmentFrom")
+  taskAssignmentsTo   TaskAssignment[] @relation("TaskAssignmentTo")
+  taskAssignmentsMade TaskAssignment[] @relation("TaskAssignmentActor")
+  taskActivities      TaskActivity[]   @relation("TaskActivityActor")
+  taskUpdates         TaskUpdate[]     @relation("TaskUpdateAuthor")
+  timeLogs            TimeLog[]        @relation("TimeLogUser")
+  blockersRaised      TaskBlocker[]    @relation("TaskBlockerRaisedBy")
+  blockersResolved    TaskBlocker[]    @relation("TaskBlockerResolvedBy")
+
+  // Activity
+  lastActiveAt  DateTime?
+  loginEvents   LoginEvent[]  @relation("UserLoginEvents")
+
+  // Audit relations
+  auditActions  AuditLog[]    @relation("AuditActor")
+  auditTargets  AuditLog[]    @relation("AuditTarget")
+
+  // KPI targets this user last edited (Team Performance Dashboard)
+  kpiTargetUpdates KpiTarget[] @relation("KpiTargetUpdatedBy")
+
+  @@index([department])
+  @@index([managerId])
+  @@index([role])
+  @@index([roleId])
+  @@index([principalId])
+  @@map("users")
+}
+
+// Enterprise audit log. `action` is a free-form string (e.g. "ROLE_CREATE",
+// "CREATE_USER", "AUTH_LOGIN") so new modules/actions need no schema change.
+model AuditLog {
+  id           String   @id @default(cuid())
+  action       String
+  entityType   String? // "user" | "role" | "assistant" | "permission" | ...
+  entityId     String?
+  actorId      String
+  actor        User     @relation("AuditActor", fields: [actorId], references: [id], onDelete: Cascade)
+  targetUserId String?
+  targetUser   User?    @relation("AuditTarget", fields: [targetUserId], references: [id], onDelete: SetNull)
+  oldValues    Json?
+  newValues    Json?
+  metadata     Json?
+  ipAddress    String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+
+  @@index([actorId])
+  @@index([targetUserId])
+  @@index([action])
+  @@index([entityType])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model LoginEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation("UserLoginEvents", fields: [userId], references: [id], onDelete: Cascade)
+  type      String // "LOGIN" | "LOGOUT" | "FAILED"
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+  @@map("login_events")
+}
+
+// ---------------------------------------------------------------------------
+// Team Performance Dashboard
+// Configurable KPI targets. One GLOBAL row (department null) + optional
+// per-DEPARTMENT overrides; a department value overrides global per-field, and
+// any null field falls back to global. GLOBAL uniqueness is enforced in the
+// service layer (Postgres treats NULLs as distinct in unique constraints).
+// ---------------------------------------------------------------------------
+
+enum TargetScope {
+  GLOBAL
+  DEPARTMENT
+}
+
+model KpiTarget {
+  id             String      @id @default(cuid())
+  scope          TargetScope
+  department     Department?
+  completionRate Int? // target completion rate (%)
+  onTimeRate     Int? // target on-time rate (%)
+  maxOverdue     Int? // max acceptable overdue task count
+  cycleTimeDays  Int? // target average cycle time (days)
+  updatedById    String?
+  updatedBy      User?       @relation("KpiTargetUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@unique([scope, department])
+  @@map("kpi_targets")
+}
+
+model RefreshToken {
+  id          String   @id @default(cuid())
+  hashedToken String
+  userId      String
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  IN_REVIEW
+  BLOCKED
+  ON_HOLD
+  COMPLETED
+  CANCELLED
+}
+
+// Type of an entry in a task's append-only delegation trail.
+enum TaskAssignmentType {
+  ASSIGN           // first assignment of the task
+  REASSIGN         // same task handed to a different user (one level down)
+  DELEGATE_SUBTASK // a child subtask was created and assigned
+  AUTO_REASSIGN    // system reassigned (e.g. assignee was deactivated)
+}
+
+// Type of an entry in a task's per-task activity history feed.
+enum TaskActivityType {
+  CREATED
+  ASSIGNED
+  REASSIGNED
+  UNASSIGNED
+  STATUS_CHANGED
+  SUBMITTED_FOR_REVIEW
+  APPROVED
+  REJECTED
+  BLOCKED
+  UNBLOCKED
+  ON_HOLD
+  RESUMED
+  PROGRESS_UPDATE
+  COMMENT_ADDED
+  TIME_LOGGED
+  ATTACHMENT_ADDED
+  ATTACHMENT_REMOVED
+  DUE_DATE_CHANGED
+  PRIORITY_CHANGED
+  SUBTASK_ADDED
+  DELETED
+}
+
+model Task {
+  id          String       @id @default(cuid())
+  title       String
+  description String?
+  priority    TaskPriority @default(MEDIUM)
+  status      TaskStatus   @default(TODO)
+  isCompleted Boolean      @default(false)
+  isImportant Boolean      @default(false)
+  isMyDay     Boolean      @default(false)
+
+  // Hierarchical task tracking
+  progressPercent Int     @default(0)     // status-derived; BLOCKED/ON_HOLD keep the prior value
+  isBlocked       Boolean @default(false)  // denormalized from the active TaskBlocker for fast filtering
+  estimateMinutes Int?                     // optional effort estimate (for time-log comparison)
+
+  // Dates
+  dueDate     DateTime?
+  dueTime     String?
+  reminderAt  DateTime?
+  completedAt DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  // Relations
+  creatorId   String
+  creator     User         @relation("TaskCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  assigneeId  String?
+  assignee    User?        @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+
+  // Who set the current assignee (the IN_REVIEW approver is resolved from the assignee's managerId)
+  assignedById String?
+  assignedBy   User?        @relation("TaskAssignedBy", fields: [assignedById], references: [id], onDelete: SetNull)
+
+  // Subtask tree (delegation by splitting work into children)
+  parentId    String?
+  parent      Task?        @relation("TaskHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children    Task[]       @relation("TaskHierarchy")
+
+  // Meeting related
+  isMeeting         Boolean  @default(false)
+  meetingUrl        String?
+  meetingStartTime  String?
+  meetingEndTime    String?
+
+  // Tags (stored as JSON array)
+  tags      String[] @default([])
+
+  // Nested relations
+  steps       TaskStep[]
+  attachments TaskAttachment[]
+  comments    TaskComment[]
+  assignments TaskAssignment[]
+  activities  TaskActivity[]
+  updates     TaskUpdate[]
+  timeLogs    TimeLog[]
+  blockers    TaskBlocker[]
+
+  @@index([creatorId])
+  @@index([assigneeId])
+  @@index([assignedById])
+  @@index([parentId])
+  @@index([isMyDay])
+  @@index([isImportant])
+  @@index([isCompleted])
+  @@index([isBlocked])
+  @@index([dueDate])
+  @@index([status])
+  @@index([priority])
+  @@index([completedAt])
+  @@index([assigneeId, completedAt])
+  @@index([assigneeId, status])
+  @@map("tasks")
+}
+
+model TaskStep {
+  id          String   @id @default(cuid())
+  title       String
+  isCompleted Boolean  @default(false)
+  order       Int
+  taskId      String
+  task        Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@index([taskId])
+  @@map("task_steps")
+}
+
+model TaskAttachment {
+  id           String   @id @default(cuid())
+  fileName     String
+  fileUrl      String
+  fileSize     Int
+  fileType     String
+  storageKey   String?  // S3 object key (for presigned download / delete)
+  taskId       String
+  task         Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  uploadedById String?
+  uploadedBy   User?    @relation("TaskAttachmentUploadedBy", fields: [uploadedById], references: [id], onDelete: SetNull)
+  uploadedAt   DateTime @default(now())
+
+  @@index([taskId])
+  @@index([uploadedById])
+  @@map("task_attachments")
+}
+
+model TaskComment {
+  id        String   @id @default(cuid())
+  content   String
+  authorId  String
+  author    User     @relation("TaskCommentAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  taskId    String
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([taskId])
+  @@index([authorId])
+  @@map("task_comments")
+}
+
+// Append-only delegation trail: one row per (re)assignment hop of a task. Lets
+// the original assigner + every manager in the chain monitor a delegated task.
+model TaskAssignment {
+  id           String             @id @default(cuid())
+  taskId       String
+  task         Task               @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  fromUserId   String? // previous assignee (null on first assignment)
+  fromUser     User?              @relation("TaskAssignmentFrom", fields: [fromUserId], references: [id], onDelete: SetNull)
+  toUserId     String? // new assignee
+  toUser       User?              @relation("TaskAssignmentTo", fields: [toUserId], references: [id], onDelete: SetNull)
+  assignedById String? // actor who performed the (re)assignment
+  assignedBy   User?              @relation("TaskAssignmentActor", fields: [assignedById], references: [id], onDelete: SetNull)
+  type         TaskAssignmentType @default(ASSIGN)
+  note         String?
+  createdAt    DateTime           @default(now())
+
+  @@index([taskId])
+  @@index([toUserId])
+  @@index([assignedById])
+  @@map("task_assignments")
+}
+
+// Per-task activity history feed (status changes, approvals, blockers, updates…).
+// This is the user-facing "what happened" log; sensitive actions are ALSO written
+// to the global AuditLog via AuditService.
+model TaskActivity {
+  id        String           @id @default(cuid())
+  taskId    String
+  task      Task             @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  actorId   String?
+  actor     User?            @relation("TaskActivityActor", fields: [actorId], references: [id], onDelete: SetNull)
+  type      TaskActivityType
+  summary   String
+  metadata  Json?
+  createdAt DateTime         @default(now())
+
+  @@index([taskId, createdAt])
+  @@index([actorId])
+  @@map("task_activities")
+}
+
+// Dated, append-only progress notes the assignee posts (the "daily update" feed).
+model TaskUpdate {
+  id              String   @id @default(cuid())
+  taskId          String
+  task            Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  authorId        String?
+  author          User?    @relation("TaskUpdateAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+  content         String
+  progressPercent Int? // optional progress snapshot at time of update
+  createdAt       DateTime @default(now())
+
+  @@index([taskId, createdAt])
+  @@index([authorId])
+  @@map("task_updates")
+}
+
+// Time logged against a task (rolls up per task / per person / per subtree).
+model TimeLog {
+  id        String   @id @default(cuid())
+  taskId    String
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  userId    String?
+  user      User?    @relation("TimeLogUser", fields: [userId], references: [id], onDelete: SetNull)
+  minutes   Int
+  note      String?
+  workDate  DateTime // the day the work was performed
+  createdAt DateTime @default(now())
+
+  @@index([taskId])
+  @@index([userId, workDate])
+  @@map("time_logs")
+}
+
+// A first-class blocker raised against a task; surfaces on manager dashboards
+// until resolved. A task may have a history of blockers; isActive flags the open one(s).
+model TaskBlocker {
+  id           String    @id @default(cuid())
+  taskId       String
+  task         Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  reason       String
+  isActive     Boolean   @default(true)
+  raisedById   String?
+  raisedBy     User?     @relation("TaskBlockerRaisedBy", fields: [raisedById], references: [id], onDelete: SetNull)
+  raisedAt     DateTime  @default(now())
+  resolvedById String?
+  resolvedBy   User?     @relation("TaskBlockerResolvedBy", fields: [resolvedById], references: [id], onDelete: SetNull)
+  resolvedAt   DateTime?
+
+  @@index([taskId, isActive])
+  @@map("task_blockers")
+}
